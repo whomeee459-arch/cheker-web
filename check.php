@@ -1,10 +1,19 @@
 <?php
 /**
- * URL Checker v6 — Semua 18 bug/issue diperbaiki
- * Fix: findMatches early-exit, GET code priority, retry→GET pipeline,
- *      CURLOPT conflict, multiRun partial failure, HEAD 405 fallback,
- *      WAF false positive, memory OOM, classifyStatus code-0, IPv4 force,
- *      source limit adaptif, note length limit
+ * URL Checker v7 — Bug fixes + SSL cert detection + SSRF protection
+ *
+ * Major changes vs v6:
+ *  - Phase 4 (SSL fallback + retry) sekarang PARALLEL via multiRun
+ *  - Real retry loop sesuai maxRetry (bukan cuma 1x)
+ *  - SSL certificate validity detection (sslInvalid flag)
+ *  - SSRF protection: blacklist private/loopback IP + protocol whitelist
+ *  - UTF-8 safe body slicing (mb_substr) + JSON_INVALID_UTF8_SUBSTITUTE
+ *  - Handle dibuat PER chunk, bukan semua sekaligus (hindari fd exhaustion)
+ *  - Header parsing untuk multi-block (redirect chain) → ambil response terakhir
+ *  - WAF detection tidak lagi false-positive untuk Cloudflare CDN normal
+ *  - curl_multi_select timeout 1.0s (bukan 50ms — hindari CPU thrashing)
+ *  - Note error di-sanitasi (strip IP/path internal)
+ *  - Body besar di-unset setelah ekstrak (hemat memory)
  */
 
 while (ob_get_level()) ob_end_clean();
@@ -32,8 +41,9 @@ $maxRetry    = max(0, min(3,   (int)($input['maxRetry']    ?? 1)));
 $followRedir = (bool)($input['followRedirect'] ?? true);
 $readSource  = (bool)($input['readSource']     ?? true);
 $headFirst   = (bool)($input['headFirst']      ?? true);
+$strictSsl   = (bool)($input['strictSsl']      ?? false);  // NEW: kalau true, cert invalid → error
+$allowPrivate = (bool)($input['allowPrivate']  ?? false);  // NEW: izinkan private IP (untuk localhost/intranet testing)
 $needScan    = !empty($queries) || !empty($blacklist);
-// FIX IMP-21: source limit adaptif
 $sourceLimit = $needScan
     ? max(5000,  min(100000, (int)($input['sourceLimit'] ?? 30000)))
     : 2000;
@@ -48,53 +58,106 @@ $UA = [
 ];
 $uaCount = count($UA);
 
-// ── FIX BUG-5: Tidak pakai CURLOPT_CUSTOMREQUEST — CURLOPT_NOBODY saja ──────
-function makeHandle(string $url, int $timeout, bool $followRedir, string $ua, bool $headOnly): mixed {
+// ── SSRF GUARD ────────────────────────────────────────────────────────────────
+// Block request ke private/loopback/link-local IP kecuali $allowPrivate=true
+function isPrivateIp(string $ip): bool {
+    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16, 0.0.0.0/8
+        return !filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
+    }
+    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+        return !filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
+    }
+    return false;
+}
+
+function validateUrl(string $url, bool $allowPrivate): array {
+    $parsed = parse_url($url);
+    if (!$parsed || empty($parsed['host']) || empty($parsed['scheme'])) {
+        return ['ok' => false, 'reason' => 'Invalid URL format'];
+    }
+    $scheme = strtolower($parsed['scheme']);
+    if ($scheme !== 'http' && $scheme !== 'https') {
+        return ['ok' => false, 'reason' => 'Only http/https allowed'];
+    }
+    if ($allowPrivate) return ['ok' => true];
+
+    $host = $parsed['host'];
+    // Resolve hostname → cek apakah private IP
+    $ips = [];
+    if (filter_var($host, FILTER_VALIDATE_IP)) {
+        $ips = [$host];
+    } else {
+        $records = @dns_get_record($host, DNS_A | DNS_AAAA);
+        if ($records) {
+            foreach ($records as $r) {
+                if (!empty($r['ip']))   $ips[] = $r['ip'];
+                if (!empty($r['ipv6'])) $ips[] = $r['ipv6'];
+            }
+        }
+        // Fallback gethostbyname (IPv4 only) kalau dns_get_record gagal
+        if (!$ips) {
+            $resolved = gethostbyname($host);
+            if ($resolved !== $host) $ips[] = $resolved;
+        }
+    }
+    if (!$ips) return ['ok' => false, 'reason' => 'DNS resolution failed'];
+    foreach ($ips as $ip) {
+        if (isPrivateIp($ip)) return ['ok' => false, 'reason' => 'Private/loopback IP blocked (set allowPrivate=true)'];
+    }
+    return ['ok' => true];
+}
+
+// ── cURL handle factory ──────────────────────────────────────────────────────
+function makeHandle(string $url, int $timeout, bool $followRedir, string $ua, bool $headOnly, bool $strictSsl): mixed {
     $ch = curl_init();
     if (!$ch) return false;
     curl_setopt_array($ch, [
         CURLOPT_URL            => $url,
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_HEADER         => true,
-        CURLOPT_NOBODY         => $headOnly,   // HEAD=true, GET=false. Tidak pakai CUSTOMREQUEST.
+        CURLOPT_NOBODY         => $headOnly,
         CURLOPT_FOLLOWLOCATION => $followRedir,
         CURLOPT_MAXREDIRS      => 5,
         CURLOPT_TIMEOUT        => $timeout,
         CURLOPT_CONNECTTIMEOUT => min(3, $timeout),
-        CURLOPT_IPRESOLVE      => CURL_IPRESOLVE_V4,  // FIX IMP-20: Force IPv4
-        CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_SSL_VERIFYHOST => false,
+        CURLOPT_IPRESOLVE      => CURL_IPRESOLVE_V4,
+        CURLOPT_SSL_VERIFYPEER => $strictSsl,
+        CURLOPT_SSL_VERIFYHOST => $strictSsl ? 2 : 0,
+        CURLOPT_CERTINFO       => true,
         CURLOPT_SSLVERSION     => CURL_SSLVERSION_DEFAULT,
         CURLOPT_USERAGENT      => $ua,
         CURLOPT_ENCODING       => '',
+        // SSRF hardening: hanya http/https, redirect juga dibatasi
+        CURLOPT_PROTOCOLS      => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+        CURLOPT_REDIR_PROTOCOLS=> CURLPROTO_HTTP | CURLPROTO_HTTPS,
         CURLOPT_HTTPHEADER     => [
             'Accept: text/html,application/xhtml+xml,*/*;q=0.8',
             'Accept-Language: en-US,en;q=0.5',
             'Connection: close',
         ],
-        CURLOPT_FRESH_CONNECT  => false,
-        CURLOPT_FORBID_REUSE   => false,
-        CURLOPT_COOKIEFILE     => '',
     ]);
     return $ch;
 }
 
 function parseResp(mixed $ch, string|false $raw): array {
-    $code     = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $hSize    = (int)curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-    $cType    = (string)curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
-    $finalUrl = (string)curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
-    $ms       = (int)round(curl_getinfo($ch, CURLINFO_TOTAL_TIME) * 1000);
-    $err      = curl_error($ch);
-    $headers  = $body = '';
+    $code        = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $hSize       = (int)curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    $cType       = (string)curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
+    $finalUrl    = (string)curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
+    $ms          = (int)round(curl_getinfo($ch, CURLINFO_TOTAL_TIME) * 1000);
+    $err         = curl_error($ch);
+    $errno       = curl_errno($ch);
+    $sslVerify   = (int)curl_getinfo($ch, CURLINFO_SSL_VERIFYRESULT);
+    $headers     = $body = '';
     if ($raw !== false && $hSize > 0) {
         $headers = substr($raw, 0, $hSize);
         $body    = (string)substr($raw, $hSize);
     }
-    return compact('code', 'headers', 'body', 'cType', 'finalUrl', 'ms', 'err');
+    return compact('code', 'headers', 'body', 'cType', 'finalUrl', 'ms', 'err', 'errno', 'sslVerify');
 }
 
-// ── FIX ISSUE-6: multiRun() handle CURLM_CALL_MULTI_PERFORM dengan benar ────
+// ── multiRun: jalankan batch handle paralel ──────────────────────────────────
 function multiRun(array $handles): array {
     $mh = curl_multi_init();
     curl_multi_setopt($mh, CURLMOPT_MAX_TOTAL_CONNECTIONS, 100);
@@ -112,7 +175,8 @@ function multiRun(array $handles): array {
     while ($mrc === CURLM_CALL_MULTI_PERFORM);
 
     while ($active > 0 && $mrc === CURLM_OK) {
-        if (curl_multi_select($mh, 0.05) === -1) usleep(10000);
+        // FIX v7: timeout 1.0s (bukan 50ms) → hindari CPU thrash
+        if (curl_multi_select($mh, 1.0) === -1) usleep(100000);
         do { $mrc = curl_multi_exec($mh, $active); }
         while ($mrc === CURLM_CALL_MULTI_PERFORM);
     }
@@ -120,7 +184,12 @@ function multiRun(array $handles): array {
     $results = [];
     foreach ($handles as $idx => $item) {
         if (!$item['ch'] || !isset($added[$idx])) {
-            $results[$idx] = ['code' => 0, 'headers' => '', 'body' => '', 'cType' => '', 'finalUrl' => $item['url'], 'ms' => 0, 'err' => 'curl_init failed'];
+            $results[$idx] = [
+                'code' => 0, 'headers' => '', 'body' => '', 'cType' => '',
+                'finalUrl' => $item['url'] ?? '', 'ms' => 0,
+                'err' => $item['preErr'] ?? 'curl_init failed',
+                'errno' => 0, 'sslVerify' => 0,
+            ];
             continue;
         }
         $results[$idx] = parseResp($item['ch'], curl_multi_getcontent($item['ch']));
@@ -131,7 +200,32 @@ function multiRun(array $handles): array {
     return $results;
 }
 
-// ── FIX BUG-10: classifyStatus eksplisit handle code 0 ───────────────────────
+// ── Helper: bangun batch handle untuk daftar URL ─────────────────────────────
+function buildHandles(array $urls, int $timeout, bool $followRedir, array $UA, int $uaCount, bool $headOnly, bool $strictSsl, array &$validation): array {
+    $handles = [];
+    foreach ($urls as $i => $url) {
+        if (isset($validation[$i]) && !$validation[$i]['ok']) {
+            $handles[$i] = ['ch' => false, 'url' => $url, 'preErr' => $validation[$i]['reason']];
+            continue;
+        }
+        $ch = makeHandle($url, $timeout, $followRedir, $UA[$i % $uaCount], $headOnly, $strictSsl);
+        $handles[$i] = ['ch' => $ch ?: false, 'url' => $url];
+    }
+    return $handles;
+}
+
+// ── Run multi-batch dengan chunking (handle dibuat PER chunk) ────────────────
+function runBatched(array $urls, int $concurrency, int $timeout, bool $followRedir, array $UA, int $uaCount, bool $headOnly, bool $strictSsl, array $validation): array {
+    $results = [];
+    foreach (array_chunk($urls, $concurrency, true) as $chunk) {
+        $handles = buildHandles($chunk, $timeout, $followRedir, $UA, $uaCount, $headOnly, $strictSsl, $validation);
+        $results += multiRun($handles);
+        unset($handles);
+    }
+    return $results;
+}
+
+// ── classifyStatus ───────────────────────────────────────────────────────────
 function classifyStatus(int $code): string {
     if ($code === 0)                     return 'error';
     if ($code >= 200 && $code < 300)    return 'ok';
@@ -145,9 +239,6 @@ function classifyStatus(int $code): string {
     return 'other';
 }
 
-// ── FIX BUG-1: findMatches early-exit benar ──────────────────────────────────
-// Bug lama: $missing dikurangi tiap item yang KETEMU (salah logic).
-// Fix: $notFound hanya dikurangi saat pattern DITEMUKAN → break saat 0.
 function findMatches(string $body, array $patterns): array {
     if (!$patterns || $body === '') return [];
     $lower    = strtolower($body);
@@ -157,212 +248,308 @@ function findMatches(string $body, array $patterns): array {
         if ($p === '') continue;
         if (strpos($lower, strtolower($p)) !== false) {
             $found[] = $p;
-            if (--$notFound === 0) break; // semua ketemu → stop scan
+            if (--$notFound === 0) break;
         }
     }
     return $found;
 }
 
-// ── FIX ISSUE-8: WAF detection spesifik, tidak agresif ───────────────────────
-function detectWaf(string $body, string $headers): bool {
+// ── WAF detection — refined: header doang TIDAK CUKUP ────────────────────────
+// FIX v7: Cloudflare CDN normal jangan dianggap WAF block.
+// WAF flag dipasang hanya kalau:
+//   (a) body mengandung sig WAF block, ATAU
+//   (b) header WAF + status code 403/406/418/429/503 (kemungkinan blocked)
+function detectWaf(int $code, string $body, string $headers): bool {
     static $bodySigs = [
-        'you have been blocked', 'your ip has been blocked',
-        'blocked by cloudflare', 'cloudflare ray id',
-        'powered by incapsula', 'sucuri website firewall',
-        'mod_security', 'access denied by',
+        'you have been blocked', 'your ip has been blocked', 'access has been denied',
+        'attention required! | cloudflare', 'sorry, you have been blocked',
+        'powered by incapsula', 'sucuri website firewall — access denied',
+        'mod_security', 'access denied by ',
         'this site is protected by',
     ];
-    static $hdrSigs = ['cf-ray:', 'x-sucuri-id:', 'x-iinfo:', 'x-protected-by:'];
+    static $hdrSigs = ['cf-ray:', 'x-sucuri-id:', 'x-iinfo:', 'x-protected-by:', 'x-sucuri-block:'];
+
     $bl = strtolower($body);
-    $hl = strtolower($headers);
     foreach ($bodySigs as $s) { if (strpos($bl, $s) !== false) return true; }
-    foreach ($hdrSigs  as $s) { if (strpos($hl, $s) !== false) return true; }
+
+    // Header sig hanya signal kalau status code tipikal block
+    if (in_array($code, [403, 406, 418, 429, 503], true)) {
+        $hl = strtolower($headers);
+        foreach ($hdrSigs as $s) { if (strpos($hl, $s) !== false) return true; }
+    }
     return false;
 }
 
-function isSslErr(string $err): bool {
+function isSslErr(int $errno, string $err): bool {
+    // cURL error codes terkait SSL/TLS
+    $sslErrnos = [35, 51, 53, 54, 58, 59, 60, 64, 66, 77, 80, 82, 83, 90, 91];
+    if (in_array($errno, $sslErrnos, true)) return true;
     if ($err === '') return false;
-    foreach (['SSL', 'certificate', 'TLS', 'handshake', 'peer', 'CAfile', 'CERT'] as $k) {
+    foreach (['SSL', 'certificate', 'TLS', 'handshake', 'CAfile', 'CERT'] as $k) {
         if (stripos($err, $k) !== false) return true;
     }
     return false;
 }
 
-function sslFallback(string $url, int $timeout, bool $followRedir, string $ua, bool $headOnly): ?array {
-    if (stripos($url, 'https://') !== 0) return null;
-    $httpUrl = 'http://' . substr($url, 8);
-    $ch = makeHandle($httpUrl, $timeout, $followRedir, $ua, $headOnly);
-    if (!$ch) return null;
-    $parsed = parseResp($ch, curl_exec($ch));
-    curl_close($ch);
-    if ($parsed['code'] > 0) {
-        $parsed['sslFallback'] = true;
-        $parsed['fallbackUrl'] = $httpUrl;
-        return $parsed;
+// FIX v7: sanitasi note error → strip IP & path lokal
+function sanitizeNote(string $err): string {
+    if ($err === '') return '';
+    // Strip IPv4 dan IPv6
+    $err = preg_replace('/\b(?:\d{1,3}\.){3}\d{1,3}\b/', '<ip>', $err);
+    $err = preg_replace('/\b[0-9a-fA-F:]{2,}:[0-9a-fA-F:]+\b/', '<ipv6>', $err);
+    // Strip path Windows & Unix
+    $err = preg_replace('#[A-Z]:\\\\[^\s,;]+#', '<path>', $err);
+    $err = preg_replace('#/(?:home|var|etc|opt|usr|root)/[^\s,;]+#', '<path>', $err);
+    return substr($err, 0, 200);
+}
+
+// FIX v7: ambil block header response TERAKHIR (skip redirect chain headers)
+function lastHeaderBlock(string $headers): string {
+    if ($headers === '') return '';
+    $headers = trim($headers);
+    // Setiap response block dipisahkan oleh \r\n\r\n
+    $blocks = preg_split('/\r\n\r\n/', $headers);
+    if (!$blocks) return $headers;
+    return end($blocks);
+}
+
+// FIX v7: UTF-8 safe slicing
+function safeSlice(string $body, int $limit): string {
+    if (strlen($body) <= $limit) return $body;
+    if (function_exists('mb_substr') && mb_check_encoding($body, 'UTF-8')) {
+        return mb_substr($body, 0, $limit, 'UTF-8');
     }
-    return null;
+    // Fallback: byte slice + strip last potential incomplete UTF-8 sequence
+    $sliced = substr($body, 0, $limit);
+    // Trim trailing bytes yang potentially incomplete multi-byte
+    while (strlen($sliced) > 0 && (ord($sliced[strlen($sliced) - 1]) & 0xC0) === 0x80) {
+        $sliced = substr($sliced, 0, -1);
+    }
+    return $sliced;
 }
 
-// Helper: GET satu URL dan kembalikan parsed result
-function doGet(string $url, int $timeout, bool $followRedir, string $ua): ?array {
-    $ch = makeHandle($url, $timeout, $followRedir, $ua, false);
-    if (!$ch) return null;
-    $parsed = parseResp($ch, curl_exec($ch));
-    curl_close($ch);
-    return $parsed['code'] > 0 ? $parsed : null;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// FASE 1: HEAD semua URL
-// ═══════════════════════════════════════════════════════════════════════════
-$headHandles = [];
+// ═════════════════════════════════════════════════════════════════════════════
+// VALIDASI URL (SSRF guard) di awal
+// ═════════════════════════════════════════════════════════════════════════════
+$validation = [];
 foreach ($urls as $i => $url) {
-    $ch = makeHandle($url, $timeout, $followRedir, $UA[$i % $uaCount], $headFirst);
-    $headHandles[$i] = ['ch' => $ch ?: false, 'url' => $url];
+    $validation[$i] = validateUrl($url, $allowPrivate);
 }
 
-$headResults = [];
-foreach (array_chunk($headHandles, $concurrency, true) as $batch) {
-    $headResults += multiRun($batch);
-}
-unset($headHandles);
+// ═════════════════════════════════════════════════════════════════════════════
+// FASE 1: HEAD/GET semua URL (bypass SSL untuk dapat content meski cert invalid)
+// ═════════════════════════════════════════════════════════════════════════════
+$headResults = runBatched($urls, $concurrency, $timeout, $followRedir, $UA, $uaCount, $headFirst, false, $validation);
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════════════
 // FASE 2: Klasifikasi URL untuk tindakan lanjutan
-// ═══════════════════════════════════════════════════════════════════════════
-$needGet         = [];  // 2xx → GET baca source
-$need405Get      = [];  // 405 → HEAD tidak support, coba GET
-$needSslFallback = [];  // SSL error → coba http://
-$needRetry       = [];  // network fail → retry
+// ═════════════════════════════════════════════════════════════════════════════
+$needGet         = [];
+$need405Get      = [];
+$needSslFallback = [];
+$needRetry       = [];
 
 foreach ($headResults as $i => $hr) {
-    $code = $hr['code'];
-    $err  = $hr['err'] ?? '';
+    if (isset($validation[$i]) && !$validation[$i]['ok']) continue;  // skip invalid URL
 
-    if ($code === 0 && isSslErr($err)) { $needSslFallback[$i] = $urls[$i]; continue; }
-    if ($code === 0 && $maxRetry > 0)  { $needRetry[$i]       = $urls[$i]; continue; }
-    if ($code === 405)                  { $need405Get[$i]      = $urls[$i]; continue; }
+    $code  = $hr['code'];
+    $err   = $hr['err'] ?? '';
+    $errno = $hr['errno'] ?? 0;
+
+    if ($code === 0 && isSslErr($errno, $err))   { $needSslFallback[$i] = $urls[$i]; continue; }
+    if ($code === 0 && $maxRetry > 0)            { $needRetry[$i]       = $urls[$i]; continue; }
+    if ($code === 405)                            { $need405Get[$i]      = $urls[$i]; continue; }
     if ($code >= 200 && $code < 300 && $readSource && $needScan) {
         $needGet[$i] = $urls[$i];
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// FASE 3: GET batch (source scan) — parallel multi-curl
-// ═══════════════════════════════════════════════════════════════════════════
-$getResults    = [];
-$get405Results = [];
+// ═════════════════════════════════════════════════════════════════════════════
+// FASE 3: GET batch — paralel via multiRun
+// ═════════════════════════════════════════════════════════════════════════════
+$getResults    = !empty($needGet)    ? runBatched($needGet,    $concurrency, $timeout, $followRedir, $UA, $uaCount, false, false, $validation) : [];
+$get405Results = !empty($need405Get) ? runBatched($need405Get, $concurrency, $timeout, $followRedir, $UA, $uaCount, false, false, $validation) : [];
 
-if (!empty($needGet)) {
-    $getHandles = [];
-    foreach ($needGet as $i => $url) {
-        $ch = makeHandle($url, $timeout, $followRedir, $UA[$i % $uaCount], false);
-        $getHandles[$i] = ['ch' => $ch ?: false, 'url' => $url];
+// ═════════════════════════════════════════════════════════════════════════════
+// FASE 4: SSL fallback (parallel) — https:// gagal → coba http://
+// ═════════════════════════════════════════════════════════════════════════════
+if (!empty($needSslFallback)) {
+    $fbUrls = [];
+    foreach ($needSslFallback as $i => $u) {
+        if (stripos($u, 'https://') === 0) {
+            $fbUrls[$i] = 'http://' . substr($u, 8);
+        }
     }
-    foreach (array_chunk($getHandles, $concurrency, true) as $batch) {
-        $getResults += multiRun($batch);
-    }
-    unset($getHandles);
-}
-
-// FIX IMP-16: GET untuk 405 — multi-curl juga
-if (!empty($need405Get)) {
-    $g405Handles = [];
-    foreach ($need405Get as $i => $url) {
-        $ch = makeHandle($url, $timeout, $followRedir, $UA[$i % $uaCount], false);
-        $g405Handles[$i] = ['ch' => $ch ?: false, 'url' => $url];
-    }
-    foreach (array_chunk($g405Handles, $concurrency, true) as $batch) {
-        $get405Results += multiRun($batch);
-    }
-    unset($g405Handles);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// FASE 4: SSL fallback + Retry individual
-// FIX BUG-3: Jika retry/ssl-fallback berhasil 2xx → GET untuk source
-// ═══════════════════════════════════════════════════════════════════════════
-foreach ($needSslFallback as $i => $url) {
-    $fb = sslFallback($url, $timeout, $followRedir, $UA[$i % $uaCount], $headFirst);
-    if ($fb) {
-        $headResults[$i] = array_merge($headResults[$i] ?? [], $fb);
-        if ($fb['code'] >= 200 && $fb['code'] < 300 && $readSource && $needScan) {
-            $gr = doGet($fb['fallbackUrl'], $timeout, $followRedir, $UA[$i % $uaCount]);
-            if ($gr) $getResults[$i] = $gr;
+    if ($fbUrls) {
+        $fbResults = runBatched($fbUrls, $concurrency, $timeout, $followRedir, $UA, $uaCount, $headFirst, false, $validation);
+        $fbGetTargets = [];
+        foreach ($fbResults as $i => $fr) {
+            if ($fr['code'] > 0) {
+                $fr['sslFallback'] = true;
+                $fr['fallbackUrl'] = $fbUrls[$i];
+                $headResults[$i]   = $fr;
+                if ($fr['code'] >= 200 && $fr['code'] < 300 && $readSource && $needScan) {
+                    $fbGetTargets[$i] = $fbUrls[$i];
+                }
+            }
+        }
+        if ($fbGetTargets) {
+            $fbGet = runBatched($fbGetTargets, $concurrency, $timeout, $followRedir, $UA, $uaCount, false, false, $validation);
+            foreach ($fbGet as $i => $g) {
+                if ($g['code'] > 0) $getResults[$i] = $g;
+            }
         }
     }
 }
 
-foreach ($needRetry as $i => $url) {
-    $ch = makeHandle($url, $timeout + 3, $followRedir, $UA[$i % $uaCount], $headFirst);
-    if (!$ch) continue;
-    $parsed = parseResp($ch, curl_exec($ch));
-    curl_close($ch);
-    if ($parsed['code'] > 0) {
-        $headResults[$i] = array_merge($headResults[$i] ?? [], $parsed, ['_retried' => true]);
-        // FIX BUG-3: retry berhasil 2xx → GET baca source
-        if ($parsed['code'] >= 200 && $parsed['code'] < 300 && $readSource && $needScan) {
-            $gr = doGet($url, $timeout, $followRedir, $UA[$i % $uaCount]);
-            if ($gr) $getResults[$i] = $gr;
+// ═════════════════════════════════════════════════════════════════════════════
+// FASE 5: Retry (parallel) — sampai $maxRetry kali atau success
+// ═════════════════════════════════════════════════════════════════════════════
+$retryAttempts = 0;
+$retryQueue    = $needRetry;
+while (!empty($retryQueue) && $retryAttempts < $maxRetry) {
+    $retryAttempts++;
+    $retryResults = runBatched($retryQueue, $concurrency, $timeout + 3, $followRedir, $UA, $uaCount, $headFirst, false, $validation);
+    $retryGetTargets = [];
+    $stillFailing    = [];
+    foreach ($retryResults as $i => $rr) {
+        if ($rr['code'] > 0) {
+            $rr['_retried']      = true;
+            $rr['_retryAttempts'] = $retryAttempts;
+            $headResults[$i]     = $rr;
+            if ($rr['code'] >= 200 && $rr['code'] < 300 && $readSource && $needScan) {
+                $retryGetTargets[$i] = $retryQueue[$i];
+            }
+        } else {
+            $stillFailing[$i] = $retryQueue[$i];
+            // Update note tapi tetap jadwalkan retry
+            $headResults[$i]['err']   = $rr['err'];
+            $headResults[$i]['errno'] = $rr['errno'];
         }
     }
+    if ($retryGetTargets) {
+        $retryGet = runBatched($retryGetTargets, $concurrency, $timeout, $followRedir, $UA, $uaCount, false, false, $validation);
+        foreach ($retryGet as $i => $g) {
+            if ($g['code'] > 0) $getResults[$i] = $g;
+        }
+    }
+    $retryQueue = $stillFailing;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// FASE 5: Assembly hasil akhir
-// FIX BUG-2: Prioritaskan code dari GET jika ada
-// FIX BUG-4: Stats logic bersih
-// ═══════════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════════════
+// FASE 6: SSL CERT VALIDITY DETECTION (NEW) — only untuk URL HTTPS yang OK
+// Pakai single extra strict-mode HEAD untuk cek cert validity tanpa tambahan
+// overhead besar (hanya untuk URL yang HEAD-nya 2xx/3xx)
+// ═════════════════════════════════════════════════════════════════════════════
+$sslCheckTargets = [];
+foreach ($urls as $i => $url) {
+    if (isset($validation[$i]) && !$validation[$i]['ok']) continue;
+    if (stripos($url, 'https://') !== 0) continue;  // only HTTPS
+    $hr = $headResults[$i] ?? null;
+    if (!$hr) continue;
+    if (!empty($hr['sslFallback'])) continue;  // sudah jelas SSL bermasalah
+    $code = (int)($hr['code'] ?? 0);
+    if ($code < 200 || $code >= 500) continue;  // skip yang gagal/server error
+    $sslCheckTargets[$i] = $url;
+}
+
+$sslCheckResults = [];
+if ($sslCheckTargets) {
+    // Strict mode: VERIFYPEER=true, VERIFYHOST=2 → kalau gagal handshake = cert invalid
+    $sslCheckResults = runBatched(
+        $sslCheckTargets, $concurrency, max(3, (int)($timeout / 2)),
+        false, $UA, $uaCount, true, true, $validation
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// FASE 7: Assembly hasil akhir
+// ═════════════════════════════════════════════════════════════════════════════
 $results = [];
 $stats   = [
     'total'        => count($urls),
     'ok'           => 0, 'match'        => 0, 'falsePositive' => 0,
     'forbidden'    => 0, 'notfound'     => 0, 'error'         => 0,
-    'retried'      => 0, 'sslSkipped'   => 0, 'waf'           => 0,
-    'headFallback' => 0,
+    'retried'      => 0, 'sslSkipped'   => 0, 'sslInvalid'    => 0,
+    'waf'          => 0, 'headFallback' => 0, 'blocked'       => 0,
 ];
 
 foreach ($urls as $i => $url) {
-    $hr = $headResults[$i]   ?? ['code' => 0, 'err' => 'no response', 'ms' => 0, 'headers' => '', 'body' => '', 'cType' => '', 'finalUrl' => $url];
+    // URL yang gagal validasi SSRF
+    if (isset($validation[$i]) && !$validation[$i]['ok']) {
+        $results[] = [
+            'url'             => $url,
+            'status'          => '—',
+            'type'            => 'error',
+            'ms'              => 0,
+            'note'            => 'BLOCKED: ' . $validation[$i]['reason'],
+            'matches'         => [], 'blacklisted' => [],
+            'isFalsePositive' => false, 'isWafBlock' => false,
+            'sslSkipped'      => false, 'sslInvalid' => false,
+            'retried'         => false, 'serverInfo' => null,
+            'source'          => null, 'sourceLength' => 0,
+            'contentType'     => '', 'finalUrl' => null,
+        ];
+        $stats['blocked']++;
+        $stats['error']++;
+        continue;
+    }
+
+    $hr = $headResults[$i]   ?? ['code' => 0, 'err' => 'no response', 'errno' => 0, 'ms' => 0, 'headers' => '', 'body' => '', 'cType' => '', 'finalUrl' => $url, 'sslVerify' => 0];
     $gr = $getResults[$i]    ?? null;
     $g4 = $get405Results[$i] ?? null;
+    $sc = $sslCheckResults[$i] ?? null;
 
-    // FIX BUG-2: GET code lebih akurat dari HEAD
     $active   = $gr ?? $g4 ?? $hr;
     $code     = (int)($active['code'] ?? 0);
     $ms       = (int)($active['ms'] ?? 0);
     $finalUrl = (string)($active['finalUrl'] ?? $url);
     $cType    = (string)($active['cType'] ?? '');
     $curlErr  = (string)($hr['err'] ?? '');
+    $curlErrno = (int)($hr['errno'] ?? 0);
+
+    // SSL cert detection
+    $sslInvalid = false;
+    $sslDetail  = null;
+    if ($sc !== null) {
+        // Kalau strict-mode handshake gagal, cert ada masalah
+        $scErrno = (int)($sc['errno'] ?? 0);
+        if ($sc['code'] === 0 && isSslErr($scErrno, (string)($sc['err'] ?? ''))) {
+            $sslInvalid = true;
+            $sslDetail  = sanitizeNote((string)($sc['err'] ?? 'SSL verification failed'));
+        }
+    }
 
     $rawHeaders = '';
     $body       = '';
     if ($gr) {
         $rawHeaders = $gr['headers'];
-        $body       = substr($gr['body'], 0, $sourceLimit);
+        $body       = safeSlice($gr['body'], $sourceLimit);
+        unset($getResults[$i]['body']);  // hemat memory
     } elseif ($g4) {
         $rawHeaders = $g4['headers'];
-        $body       = substr($g4['body'], 0, $sourceLimit);
+        $body       = safeSlice($g4['body'], $sourceLimit);
+        unset($get405Results[$i]['body']);
         $stats['headFallback']++;
     } else {
         $rawHeaders = $hr['headers'] ?? '';
     }
 
-    // FIX BUG-10: classifyStatus handle code 0
     $type    = classifyStatus($code);
     $matches = findMatches($body, $queries);
     $blHits  = findMatches($body, $blacklist);
 
-    // FIX BUG-4: cek isFP SEBELUM ubah $type, tidak double-check
     $isFP = ($type === 'ok') && !empty($blHits);
     if ($isFP) $type = 'false_positive';
 
-    // FIX ISSUE-8: WAF hanya dicek saat type masih 'ok' (bukan false_positive)
-    $isWaf = ($type === 'ok') && detectWaf($body, $rawHeaders);
+    // FIX v7: WAF detection sekarang butuh body sig, atau header sig + status code blok
+    $isWaf = ($type === 'ok' || $type === 'forbidden' || $type === 'rate_limited')
+        && detectWaf($code, $body, $rawHeaders);
 
-    // Parse server info
-    $serverInfo = [];
-    foreach (explode("\r\n", $rawHeaders) as $hl) {
+    // Parse server info hanya dari block header response TERAKHIR
+    $serverInfo  = [];
+    $finalHeader = lastHeaderBlock($rawHeaders);
+    foreach (explode("\r\n", $finalHeader) as $hl) {
         if (preg_match('/^(Server|X-Powered-By|X-Generator|X-AspNet-Version):\s*(.+)$/i', $hl, $m)) {
             $serverInfo[strtolower($m[1])] = trim($m[2]);
         }
@@ -377,15 +564,14 @@ foreach ($urls as $i => $url) {
     if ($type === 'error')      $stats['error']++;
     if (!empty($hr['_retried'])) $stats['retried']++;
     if (!empty($hr['sslFallback'])) $stats['sslSkipped']++;
+    if ($sslInvalid) $stats['sslInvalid']++;
     if ($isWaf) $stats['waf']++;
 
-    // FIX ISSUE-9: Kirim source penuh hanya jika ada match/bl hits
-    // Jika tidak ada match, kirim preview 500 char saja untuk debug
     $sendSource = null;
     if ($readSource && $body !== '') {
         $sendSource = (!empty($matches) || !empty($blHits))
             ? $body
-            : substr($body, 0, 500);
+            : safeSlice($body, 500);
     }
 
     $results[] = [
@@ -402,18 +588,19 @@ foreach ($urls as $i => $url) {
         'isFalsePositive' => $isFP,
         'isWafBlock'      => $isWaf,
         'sslSkipped'      => !empty($hr['sslFallback']),
+        'sslInvalid'      => $sslInvalid,
+        'sslDetail'       => $sslDetail,
         'fallbackUrl'     => $hr['fallbackUrl'] ?? null,
         'retried'         => !empty($hr['_retried']),
+        'retryAttempts'   => $hr['_retryAttempts'] ?? 0,
         'serverInfo'      => $serverInfo ?: null,
-        // FIX: batasi note 200 char agar tidak bocorkan path server
-        'note'            => $curlErr ? substr($curlErr, 0, 200) : null,
+        'note'            => $curlErr ? sanitizeNote($curlErr) : null,
     ];
 }
 
-// FIX ISSUE-9: unset sebelum encode untuk hemat memory
-unset($headResults, $getResults, $get405Results);
+unset($headResults, $getResults, $get405Results, $sslCheckResults);
 
 echo json_encode(
     ['success' => true, 'count' => count($results), 'stats' => $stats, 'results' => $results],
-    JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+    JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR
 );
